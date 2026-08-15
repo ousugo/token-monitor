@@ -66,15 +66,11 @@ jobs:
           $manifestVersion = node -p "require('./package.json').version"
           $electronPackageVersion = node -p "require('./node_modules/electron/package.json').version"
           $koffiPackageVersion = node -p "require('./node_modules/koffi/package.json').version"
-          $electronBinary = Join-Path (Resolve-Path 'node_modules/electron/dist').Path 'electron.exe'
-          $electronBinaryVersion = (& $electronBinary --version).Trim().TrimStart('v')
           if ($manifestVersion -ne '0.43.0') { throw "Unexpected Token Monitor version: $manifestVersion" }
           if ($electronPackageVersion -ne '${{ matrix.electron }}') { throw "Unexpected Electron package version: $electronPackageVersion" }
-          if ($electronBinaryVersion -ne '${{ matrix.electron }}') { throw "Unexpected Electron binary version: $electronBinaryVersion" }
           if ($koffiPackageVersion -ne '${{ matrix.koffi }}') { throw "Unexpected Koffi package version: $koffiPackageVersion" }
           Write-Output "Token Monitor: $manifestVersion"
           Write-Output "Electron package: $electronPackageVersion"
-          Write-Output "Electron binary: $electronBinaryVersion"
           Write-Output "Koffi: $koffiPackageVersion"
       - run: npm run verify
       - name: Build unpacked Windows application

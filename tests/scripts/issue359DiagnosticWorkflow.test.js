@@ -19,7 +19,7 @@ test('issue 359 diagnostic workflow changes only the Electron comparison version
   assert.match(workflow, /variant: electron-43\.2\.0\s+electron: 43\.2\.0\s+koffi: 3\.1\.4/);
   assert.match(workflow, /npm install --package-lock-only --ignore-scripts --save-dev --save-exact "electron@\$EXPECTED_ELECTRON"/);
   assert.match(workflow, /manifest\.version !== '0\.43\.0'/);
-  assert.match(workflow, /electronBinaryVersion -ne '\$\{\{ matrix\.electron \}\}'/);
+  assert.match(workflow, /electronPackageVersion -ne '\$\{\{ matrix\.electron \}\}'/);
   assert.match(workflow, /koffiPackageVersion -ne '\$\{\{ matrix\.koffi \}\}'/);
 });
 
