@@ -1,0 +1,216 @@
+name: Issue 359 Windows diagnostics
+
+on:
+  push:
+    branches:
+      - test/issue-359-diagnostic-builds
+    paths:
+      - .github/workflows/issue-359-diagnostic.yml
+
+run-name: 'Issue #359 Electron comparison builds'
+
+concurrency:
+  group: issue-359-windows-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: electron-43.4.0
+            electron: 43.4.0
+            koffi: 3.1.4
+          - variant: electron-43.2.0
+            electron: 43.2.0
+            koffi: 3.1.4
+    steps:
+      # Keep the product source and packaging metadata identical to the version
+      # independently reproduced in issue #359. This workflow is intentionally
+      # limited to its temporary diagnostic branch and never enters main.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: v0.43.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Pin comparison Electron version
+        shell: bash
+        env:
+          EXPECTED_ELECTRON: ${{ matrix.electron }}
+        run: |
+          set -euo pipefail
+          npm install --package-lock-only --ignore-scripts --save-dev --save-exact "electron@$EXPECTED_ELECTRON"
+          node <<'NODE'
+          const manifest = require('./package.json');
+          const lockfile = require('./package-lock.json');
+          const expected = process.env.EXPECTED_ELECTRON;
+          if (manifest.version !== '0.43.0') throw new Error(`unexpected Token Monitor version: ${manifest.version}`);
+          if (manifest.devDependencies.electron !== expected) throw new Error(`unexpected Electron manifest version: ${manifest.devDependencies.electron}`);
+          if (manifest.dependencies.koffi !== '^3.1.4') throw new Error(`unexpected Koffi manifest version: ${manifest.dependencies.koffi}`);
+          if (lockfile.packages['node_modules/electron']?.version !== expected) throw new Error(`unexpected Electron lock version: ${lockfile.packages['node_modules/electron']?.version}`);
+          if (lockfile.packages['node_modules/koffi']?.version !== '3.1.4') throw new Error(`unexpected Koffi lock version: ${lockfile.packages['node_modules/koffi']?.version}`);
+          NODE
+          git diff -- package.json package-lock.json
+      - run: npm ci
+      - name: Verify resolved comparison versions
+        shell: pwsh
+        run: |
+          $manifestVersion = node -p "require('./package.json').version"
+          $electronPackageVersion = node -p "require('./node_modules/electron/package.json').version"
+          $koffiPackageVersion = node -p "require('./node_modules/koffi/package.json').version"
+          $electronBinary = Join-Path (Resolve-Path 'node_modules/electron/dist').Path 'electron.exe'
+          $electronBinaryVersion = (& $electronBinary --version).Trim().TrimStart('v')
+          if ($manifestVersion -ne '0.43.0') { throw "Unexpected Token Monitor version: $manifestVersion" }
+          if ($electronPackageVersion -ne '${{ matrix.electron }}') { throw "Unexpected Electron package version: $electronPackageVersion" }
+          if ($electronBinaryVersion -ne '${{ matrix.electron }}') { throw "Unexpected Electron binary version: $electronBinaryVersion" }
+          if ($koffiPackageVersion -ne '${{ matrix.koffi }}') { throw "Unexpected Koffi package version: $koffiPackageVersion" }
+          Write-Output "Token Monitor: $manifestVersion"
+          Write-Output "Electron package: $electronPackageVersion"
+          Write-Output "Electron binary: $electronBinaryVersion"
+          Write-Output "Koffi: $koffiPackageVersion"
+      - run: npm run verify
+      - name: Build unpacked Windows application
+        run: npm run dist:win:dir
+      - name: Write Windows updater configuration
+        run: node scripts/signpath-windows-artifacts.js write-update-config dist/win-unpacked
+      - name: Prepare Windows application for signing
+        id: prepare-unsigned-win-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/signpath-windows-artifacts.js prepare-application \
+            dist/win-unpacked "$RUNNER_TEMP/signpath-application-input" >> "$GITHUB_OUTPUT"
+      - name: Upload unsigned Windows application
+        id: upload-unsigned-win-app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-windows-application-${{ matrix.variant }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          path: ${{ runner.temp }}/signpath-application-input
+      - name: Code-sign Windows application (SignPath)
+        uses: SignPath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 8bf2856b-5fb0-4c78-ba99-90931fcce837
+          project-slug: token-monitor
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: application
+          github-artifact-id: ${{ steps.upload-unsigned-win-app.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signpath-application-output
+          parameters: |
+            version: ${{ toJSON(steps.prepare-unsigned-win-app.outputs.product_version) }}
+      - name: Apply signed Windows application
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/signpath-windows-artifacts.js apply-application \
+            dist/win-unpacked dist/signpath-application-output
+      - name: Verify Windows application Authenticode signature
+        shell: pwsh
+        run: |
+          $application = Get-Item -LiteralPath (Join-Path 'dist/win-unpacked' '${{ steps.prepare-unsigned-win-app.outputs.application }}') -ErrorAction Stop
+          $signature = Get-AuthenticodeSignature -FilePath $application.FullName
+          $subject = $signature.SignerCertificate.Subject
+          Write-Output "$($application.Name) - Status: $($signature.Status), Signer: $subject"
+          if ($signature.Status -ne 'Valid') { throw "$($application.Name) Authenticode status is $($signature.Status), expected Valid" }
+          if ($subject -notlike '*SignPath Foundation*') { throw "$($application.Name) has unexpected signer: $subject" }
+          if (-not $signature.TimeStamperCertificate) { throw "$($application.Name) has no Authenticode timestamp" }
+      - name: Package signed Windows application
+        run: npm run dist:win:prepackaged
+      - name: Prepare Windows artifacts for signing
+        id: prepare-unsigned-win
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/signpath-windows-artifacts.js prepare-artifacts \
+            dist "$RUNNER_TEMP/signpath-artifact-input" >> "$GITHUB_OUTPUT"
+      - name: Upload unsigned Windows artifacts
+        id: upload-unsigned-win
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-windows-artifacts-${{ matrix.variant }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/signpath-artifact-input/installer/${{ steps.prepare-unsigned-win.outputs.installer }}
+            ${{ runner.temp }}/signpath-artifact-input/portable/${{ steps.prepare-unsigned-win.outputs.portable }}
+      - name: Code-sign Windows artifacts (SignPath)
+        uses: SignPath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 8bf2856b-5fb0-4c78-ba99-90931fcce837
+          project-slug: token-monitor
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: initial
+          github-artifact-id: ${{ steps.upload-unsigned-win.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signpath-artifact-output
+          parameters: |
+            version: ${{ toJSON(steps.prepare-unsigned-win.outputs.version) }}
+      - name: Apply signed Windows artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/signpath-windows-artifacts.js apply-artifacts \
+            dist dist/signpath-artifact-output
+      - name: Verify Windows artifact Authenticode signatures
+        shell: pwsh
+        run: |
+          $expected = @(
+            '${{ steps.prepare-unsigned-win.outputs.installer }}',
+            '${{ steps.prepare-unsigned-win.outputs.portable }}'
+          )
+          foreach ($fileName in $expected) {
+            $artifact = Get-Item -LiteralPath (Join-Path 'dist' $fileName) -ErrorAction Stop
+            $signature = Get-AuthenticodeSignature -FilePath $artifact.FullName
+            $subject = $signature.SignerCertificate.Subject
+            Write-Output "$fileName - Status: $($signature.Status), Signer: $subject"
+            if ($signature.Status -ne 'Valid') { throw "$fileName Authenticode status is $($signature.Status), expected Valid" }
+            if ($subject -notlike '*SignPath Foundation*') { throw "$fileName has unexpected signer: $subject" }
+            if (-not $signature.TimeStamperCertificate) { throw "$fileName has no Authenticode timestamp" }
+          }
+      - name: Write diagnostic build evidence
+        shell: pwsh
+        run: |
+          $files = @(
+            '${{ steps.prepare-unsigned-win.outputs.installer }}',
+            '${{ steps.prepare-unsigned-win.outputs.portable }}'
+          )
+          $lines = @(
+            'Issue: #359',
+            'Base source: v0.43.0',
+            'Token Monitor: 0.43.0',
+            'Variant: ${{ matrix.variant }}',
+            'Electron: ${{ matrix.electron }}',
+            'Koffi: ${{ matrix.koffi }}'
+          )
+          foreach ($fileName in $files) {
+            $artifact = Get-Item -LiteralPath (Join-Path 'dist' $fileName) -ErrorAction Stop
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash
+            $lines += "SHA-256 $fileName`: $hash"
+          }
+          $lines | Set-Content -LiteralPath 'dist/issue-359-build-info.txt' -Encoding utf8
+          Get-Content -LiteralPath 'dist/issue-359-build-info.txt'
+      - name: Upload signed diagnostic artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue-359-${{ matrix.variant }}-koffi-${{ matrix.koffi }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          path: |
+            dist/${{ steps.prepare-unsigned-win.outputs.installer }}
+            dist/${{ steps.prepare-unsigned-win.outputs.portable }}
+            dist/issue-359-build-info.txt
